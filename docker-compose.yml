@@ -1,0 +1,61 @@
+# Local development stack: govault API + PostgreSQL.
+#
+# No secrets are hardcoded here. Values come from the .env file in this
+# directory (copy .env.example -> .env first). Compose reads .env automatically
+# for ${VAR} substitution, and the app also receives it via env_file.
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      # Published so you can run migrations / psql from the host if you want.
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    # ENCRYPTION_KEY, PASETO_KEY, PORT come from .env.
+    env_file: .env
+    # DATABASE_URL is overridden to point at the "db" service (not localhost).
+    # Built from the same POSTGRES_* vars, so no secret is duplicated/hardcoded.
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}?sslmode=disable
+    ports:
+      - "${PORT:-8080}:${PORT:-8080}"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  # One-shot migration runner. Reuses the app image but overrides the entrypoint
+  # to run the migrate binary. Not started by `up` (guarded by a profile); run
+  # it explicitly with: docker compose run --rm migrate
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    profiles: ["migrate"]
+    entrypoint: ["/app/migrate"]
+    env_file: .env
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}?sslmode=disable
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:

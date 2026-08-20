@@ -1,0 +1,43 @@
+# Keep the build context tiny and never leak local files/secrets into the image.
+
+# Version control
+.git
+.gitignore
+.gitattributes
+
+# Local environment / secrets — must never be baked into an image
+.env
+.env.*
+
+# Docs
+README.md
+*.md
+
+# Docker-related files (not needed inside the build context)
+Dockerfile
+.dockerignore
+docker-compose.yml
+docker-compose.*.yml
+
+# Build artifacts / binaries
+bin/
+govault
+govault.exe
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+coverage.*
+
+# Go workspace files
+go.work
+go.work.sum
+
+# Editor / OS cruft
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
