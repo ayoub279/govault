@@ -1,0 +1,121 @@
+name: CI
+
+# Phase 3: build + test only. No security scanning (Gitleaks/Semgrep/Trivy) and
+# no deployment yet — those land in later phases.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: Build & Test
+    runs-on: ubuntu-latest
+
+    # Postgres is available to every step below (DATABASE_URL points at it).
+    # No integration tests exist yet, but this keeps the job ready for the
+    # ones added in a later phase without needing a workflow change.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: govault_ci
+          POSTGRES_PASSWORD: govault_ci_password
+          POSTGRES_DB: govault_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U govault_ci -d govault_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      # Test-only credentials for the ephemeral CI Postgres container above —
+      # not real secrets, and this database is destroyed when the job ends.
+      DATABASE_URL: postgres://govault_ci:govault_ci_password@localhost:5432/govault_test?sslmode=disable
+      PORT: 8080
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go 1.26
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+
+      - name: Generate dummy CI keys (not production values)
+        run: |
+          echo "ENCRYPTION_KEY=$(openssl rand -hex 32)" >> "$GITHUB_ENV"
+          echo "PASETO_KEY=$(openssl rand -hex 32)" >> "$GITHUB_ENV"
+
+      - name: Build (go build ./...)
+        run: go build ./...
+
+      - name: Vet (go vet ./...)
+        run: go vet ./...
+
+      - name: Check for test files
+        id: has_tests
+        run: |
+          if find . -name '*_test.go' -not -path './.git/*' | grep -q .; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Test (go test ./...)
+        if: steps.has_tests.outputs.found == 'true'
+        run: go test ./... -v
+
+      - name: No tests yet
+        if: steps.has_tests.outputs.found == 'false'
+        run: |
+          echo "::notice::No _test.go files found yet — skipping go test. Expected for Phase 3; add tests in a later phase."
+          {
+            echo "### ℹ️ Tests"
+            echo "No \`*_test.go\` files exist yet, so \`go test ./...\` was skipped."
+            echo "This is expected at this phase — build and vet still ran and gated the job."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  docker-build:
+    name: Docker Build
+    runs-on: ubuntu-latest
+    # No `needs:` — runs in parallel with build-and-test.
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image (not pushed anywhere)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: false
+          load: true # load into the local Docker daemon so we can inspect its size below
+          tags: govault:ci
+
+      - name: Report image size
+        run: |
+          BYTES=$(docker image inspect govault:ci --format='{{.Size}}')
+          MB=$(awk "BEGIN { printf \"%.2f\", $BYTES/1024/1024 }")
+          echo "Image size: ${MB} MB (${BYTES} bytes)"
+          {
+            echo "### 🐳 Docker image size"
+            echo ""
+            echo "\`govault:ci\` = **${MB} MB** (${BYTES} bytes)"
+            echo ""
+            echo '```'
+            docker images govault:ci
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
