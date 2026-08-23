@@ -1,11 +1,15 @@
 name: CI
 
-# Phase 3 added build + test. Phase 4 added Gitleaks secrets scanning below.
-# Semgrep/Trivy and deployment still come in later phases.
+# Phase 3 added build + test. Phase 4 added Gitleaks secrets scanning.
+# Phase 5 added Semgrep SAST below. Trivy and deployment still come later.
 
 on:
   push:
-    branches: [main]
+    # TEMP (test/semgrep-verify only): includes this throwaway branch so a
+    # plain push triggers the workflow without opening a PR, to verify the
+    # new sast-scan job actually catches something. Reverted to just [main]
+    # before this ever lands on main.
+    branches: [main, test/semgrep-verify]
   pull_request:
     branches: [main]
 
@@ -141,3 +145,36 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITLEAKS_CONFIG: .gitleaks.toml
+
+  sast-scan:
+    name: SAST Scan (Semgrep)
+    runs-on: ubuntu-latest
+    # Semgrep's own image ships the CLI pre-installed — simpler and gives
+    # explicit control over which rule packs run than the marketplace
+    # semgrep-action, which is oriented around Semgrep's paid SaaS platform
+    # (expects a SEMGREP_APP_TOKEN). We don't have or need one for this.
+    container:
+      image: semgrep/semgrep
+    # No `needs:` — runs in parallel with the other three jobs.
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Semgrep (Go default + security-audit rules)
+        # p/secrets is deliberately NOT included: Gitleaks already runs as its
+        # own dedicated job for that exact category (hardcoded credentials),
+        # so adding Semgrep's secrets ruleset here would just duplicate the
+        # same findings. This job instead targets code-level vulnerability
+        # *patterns* Gitleaks never looks for at all — SQL injection, weak
+        # crypto usage, unsafe deserialization, etc.
+        #
+        # --error: exit non-zero if there are any findings, so this step (and
+        # therefore the job) fails on a real hit. See PR/commit description
+        # for the blocking-vs-report-only tradeoff and why blocking was
+        # chosen here.
+        run: |
+          semgrep scan \
+            --config p/golang \
+            --config p/security-audit \
+            --error \
+            .
