@@ -1,7 +1,7 @@
 name: CI
 
-# Phase 3: build + test only. No security scanning (Gitleaks/Semgrep/Trivy) and
-# no deployment yet — those land in later phases.
+# Phase 3 added build + test. Phase 4 added Gitleaks secrets scanning below.
+# Semgrep/Trivy and deployment still come in later phases.
 
 on:
   push:
@@ -119,3 +119,25 @@ jobs:
             docker images govault:ci
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+  secrets-scan:
+    name: Secrets Scan (Gitleaks)
+    runs-on: ubuntu-latest
+    # No `needs:` — runs in parallel with build-and-test and docker-build so a
+    # clean commit isn't held up waiting on the other jobs, and vice versa.
+    steps:
+      - name: Checkout code (full history for commit-range diffing)
+        uses: actions/checkout@v4
+        with:
+          # gitleaks-action resolves the exact commit range for the push/PR
+          # event (event.before..event.after, or PR base..head) and needs
+          # those commits present locally to diff — hence full history here.
+          # This does NOT mean gitleaks scans the whole history for secrets;
+          # it only scans the commits introduced by this push/PR.
+          fetch-depth: 0
+
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_CONFIG: .gitleaks.toml

@@ -1,0 +1,21 @@
+# Gitleaks configuration for govault.
+#
+# Extends gitleaks' built-in default ruleset (recommended, kept up to date
+# upstream) rather than redefining rules from scratch.
+#
+# Allowlist policy: keep this list as short as possible. Every entry here is a
+# blind spot for real secret detection. Do NOT add further entries without
+# explicit review — see requirement in Phase 4 CI task.
+
+title = "govault gitleaks config"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Known placeholder/example files - not real secrets"
+paths = [
+  # .env.example only ever contains documented placeholder values (see the
+  # file itself) — the real .env is gitignored and never committed.
+  '''(^|/)\.env\.example$''',
+]
