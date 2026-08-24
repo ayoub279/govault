@@ -207,6 +207,13 @@ jobs:
         # dependencies our code never touches. Exits non-zero on any finding
         # (govulncheck already only reports genuinely reachable vulns, so no
         # extra severity filtering is needed here).
+        #
+        # continue-on-error: so a failure here doesn't skip the Trivy step
+        # below — both tools' findings should always be visible in the log,
+        # not just whichever one happens to run first. The job is still
+        # failed explicitly by the final step if either tool found anything.
+        id: govulncheck
+        continue-on-error: true
         run: govulncheck ./...
 
       - name: Run Trivy (filesystem/dependency scan)
@@ -219,6 +226,8 @@ jobs:
         # secrets and misconfig, but Gitleaks already owns secrets scanning
         # as its own dedicated job, so enabling that here would just
         # duplicate findings.
+        id: trivy
+        continue-on-error: true
         uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: fs
@@ -226,3 +235,9 @@ jobs:
           scanners: vuln
           severity: HIGH,CRITICAL
           exit-code: "1"
+
+      - name: Fail the job if either tool found something
+        if: steps.govulncheck.outcome == 'failure' || steps.trivy.outcome == 'failure'
+        run: |
+          echo "::error::govulncheck outcome=${{ steps.govulncheck.outcome }}, trivy outcome=${{ steps.trivy.outcome }}"
+          exit 1
