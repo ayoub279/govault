@@ -9,6 +9,7 @@ require (
 	github.com/joho/godotenv v1.5.1
 	github.com/o1egl/paseto v1.0.0
 	golang.org/x/crypto v0.31.0
+	golang.org/x/text v0.21.0
 )
 
 require (
@@ -21,5 +22,10 @@ require (
 	github.com/pkg/errors v0.8.0 // indirect
 	golang.org/x/sync v0.10.0 // indirect
 	golang.org/x/sys v0.28.0 // indirect
-	golang.org/x/text v0.21.0 // indirect
 )
+
+// TEMP (test/depscan-verify only): force a known-vulnerable x/text version
+// (CVE-2021-38561 / GO-2021-0113, fixed in v0.3.7) to verify the
+// dependency-scan CI job actually catches it. Removed before this branch is
+// done being used; never lands on main.
+replace golang.org/x/text => golang.org/x/text v0.3.6

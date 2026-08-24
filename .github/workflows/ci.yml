@@ -1,11 +1,16 @@
 name: CI
 
 # Phase 3 added build + test. Phase 4 added Gitleaks secrets scanning.
-# Phase 5 added Semgrep SAST below. Trivy and deployment still come later.
+# Phase 5 added Semgrep SAST. Phase 6 added dependency/SCA scanning below.
+# Deployment still comes later.
 
 on:
   push:
-    branches: [main]
+    # TEMP (test/depscan-verify only): includes this throwaway branch so a
+    # plain push triggers the workflow without opening a PR, to verify the
+    # new dependency-scan job actually catches something. Reverted to just
+    # [main] before this ever lands on main.
+    branches: [main, test/depscan-verify]
   pull_request:
     branches: [main]
 
@@ -174,3 +179,50 @@ jobs:
             --config p/security-audit \
             --error \
             .
+
+  dependency-scan:
+    name: Dependency Scan (govulncheck + Trivy)
+    runs-on: ubuntu-latest
+    # No `needs:` — runs in parallel with the other four jobs.
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go 1.26
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+
+      - name: Run govulncheck
+        # govulncheck does call-graph reachability analysis on top of the Go
+        # vulnerability database (vuln.go.dev): it only flags a CVE if our
+        # code actually calls into the vulnerable code path, not merely
+        # because a vulnerable version happens to sit somewhere in go.sum.
+        # That makes it far lower-noise than a naive "is this version ever
+        # vulnerable" dependency-list scan, which would also flag transitive
+        # dependencies our code never touches. Exits non-zero on any finding
+        # (govulncheck already only reports genuinely reachable vulns, so no
+        # extra severity filtering is needed here).
+        run: govulncheck ./...
+
+      - name: Run Trivy (filesystem/dependency scan)
+        # Trivy's vulnerability DB is broader than govulncheck's (which is
+        # Go-specific and reachability-scoped), so this is a complementary
+        # second layer, not pure duplication — it flags a known-vulnerable
+        # version straight from go.mod/go.sum even when govulncheck's
+        # reachability analysis can't establish a call path. `scanners: vuln`
+        # scopes this to vulnerabilities only: Trivy can also scan for
+        # secrets and misconfig, but Gitleaks already owns secrets scanning
+        # as its own dedicated job, so enabling that here would just
+        # duplicate findings.
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          exit-code: "1"
