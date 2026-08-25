@@ -27,15 +27,14 @@ RUN GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldflags="-s -w" -o
 ##############################
 # Final stage
 ##############################
-# distroless/static: no shell, no package manager, no libc — just CA certs,
-# /etc/passwd, tzdata. Smallest sensible base for a static Go binary and the
-# smallest attack surface for a security-focused service.
-FROM gcr.io/distroless/static-debian12:nonroot
-
-# The :nonroot variant ships a "nonroot" user with UID/GID 65532. We set it
-# explicitly (rather than relying on the tag's default) so the runtime user is
-# auditable and won't silently change if the base image is swapped.
-USER 65532:65532
+# TEMP (test/imagescan-verify only): deliberately swapped to an old, EOL,
+# root-by-default base image with real HIGH/CRITICAL CVEs (verified locally:
+# 30 vulnerabilities, 28 HIGH + 2 CRITICAL) and the explicit USER line
+# removed, to verify the Phase 7 image-scan CI gate actually catches both a
+# real OS-vuln finding and a real "runs as root" finding. Reverted to
+# distroless/nonroot before this branch is done being used; never lands on
+# main.
+FROM debian:9
 
 WORKDIR /app
 

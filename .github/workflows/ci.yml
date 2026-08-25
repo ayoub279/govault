@@ -1,12 +1,17 @@
 name: CI
 
 # Phase 3 added build + test. Phase 4 added Gitleaks secrets scanning.
-# Phase 5 added Semgrep SAST. Phase 6 added dependency/SCA scanning below.
-# Deployment still comes later.
+# Phase 5 added Semgrep SAST. Phase 6 added dependency/SCA scanning.
+# Phase 7 added container image scanning (inside docker-build). Deployment
+# still comes later.
 
 on:
   push:
-    branches: [main]
+    # TEMP (test/imagescan-verify only): includes this throwaway branch so a
+    # plain push triggers the workflow without opening a PR, to verify the
+    # image-scan additions actually catch something. Reverted to just [main]
+    # before this ever lands on main.
+    branches: [main, test/imagescan-verify]
   pull_request:
     branches: [main]
 
@@ -87,9 +92,15 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   docker-build:
-    name: Docker Build
+    name: Docker Build & Scan
     runs-on: ubuntu-latest
-    # No `needs:` — runs in parallel with build-and-test.
+    # No `needs:` — runs in parallel with the other jobs. Image scanning is
+    # done in THIS job (Phase 7), not a separate one with `needs: docker-build`
+    # — the built image only exists in this runner's local Docker daemon
+    # (load: true below), and a separate job runs on a fresh VM with no access
+    # to it. Splitting it out would mean docker save/upload-artifact/
+    # download-artifact/docker load just to hand the image across, for a
+    # tightly-coupled "scan the thing we just built" step. Not worth it here.
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -120,6 +131,52 @@ jobs:
             docker images govault:ci
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Scan built image for OS package vulnerabilities (Trivy)
+        # scan-type: image (not fs, which is Phase 6's job — that scanned our
+        # Go module dependencies as source). This scans the actual BUILT
+        # image: base OS packages and layers. `scanners: misconfig` is also
+        # enabled for completeness (catches IaC files accidentally baked into
+        # a layer), though empirically it does NOT evaluate an image's
+        # runtime USER field — see the dedicated step below for that.
+        id: trivy-image
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: image
+          image-ref: govault:ci
+          scanners: vuln,misconfig
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+
+      - name: Verify container runs as non-root (real built image, not Dockerfile text)
+        # Trivy's `misconfig` scanner in image mode only checks for IaC files
+        # embedded IN the image filesystem (Dockerfiles/k8s manifests/etc.
+        # baked into a layer) — verified empirically that it does NOT
+        # evaluate an image's actual runtime USER field: scanning a
+        # known-root-by-default public image (no USER set at all) still
+        # reports misconfig as "not scanned", identical to a correctly
+        # non-root image. So rather than rely on a misconfig finding that
+        # doesn't actually fire either way, we read the real, post-build USER
+        # straight from the image's own config metadata via `docker inspect`
+        # — this reflects what the built image actually runs as, not what
+        # the Dockerfile merely declares.
+        id: nonroot-check
+        continue-on-error: true
+        run: |
+          USER_ID=$(docker inspect --format='{{.Config.User}}' govault:ci)
+          echo "Image USER: '${USER_ID}'"
+          if [ -z "$USER_ID" ] || [ "$USER_ID" = "0" ] || [ "$USER_ID" = "0:0" ] || [ "$USER_ID" = "root" ]; then
+            echo "::error::Container image is NOT configured to run as non-root (USER='${USER_ID}')"
+            exit 1
+          fi
+          echo "::notice::Container correctly runs as non-root (USER='${USER_ID}')"
+
+      - name: Fail the job if the image scan or non-root check found something
+        if: steps.trivy-image.outcome == 'failure' || steps.nonroot-check.outcome == 'failure'
+        run: |
+          echo "::error::trivy-image outcome=${{ steps.trivy-image.outcome }}, nonroot-check outcome=${{ steps.nonroot-check.outcome }}"
+          exit 1
 
   secrets-scan:
     name: Secrets Scan (Gitleaks)
