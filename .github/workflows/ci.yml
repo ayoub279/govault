@@ -2,8 +2,8 @@ name: CI
 
 # Phase 3 added build + test. Phase 4 added Gitleaks secrets scanning.
 # Phase 5 added Semgrep SAST. Phase 6 added dependency/SCA scanning.
-# Phase 7 added container image scanning (inside docker-build). Deployment
-# still comes later.
+# Phase 7 added container image scanning (inside docker-build). Phase 8
+# added the policy-as-code gate below. Deployment still comes later.
 
 on:
   push:
@@ -290,3 +290,27 @@ jobs:
         run: |
           echo "::error::govulncheck outcome=${{ steps.govulncheck.outcome }}, trivy outcome=${{ steps.trivy.outcome }}"
           exit 1
+
+  policy-check:
+    name: Policy Check (Conftest/OPA)
+    runs-on: ubuntu-latest
+    # Conftest's own image ships the binary pre-installed — same pattern as
+    # the Semgrep job (much faster than `go install`-ing it fresh every run).
+    container:
+      image: openpolicyagent/conftest:v0.69.0
+    # No `needs:` — runs in parallel with the other five jobs.
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Evaluate Dockerfile against policy (Rego, /policy)
+        # Policy-as-code: explicit, declarative rules this project's
+        # Dockerfile must satisfy, on top of (not instead of) the
+        # vulnerability/secret/SAST scanners in the earlier jobs. See
+        # /policy/*.rego for what each rule enforces and why. Several of
+        # them (ADD vs COPY, no installs in the final stage, HEALTHCHECK
+        # required) check things none of the other jobs look at *at all* —
+        # Dockerfile instruction semantics, not CVEs, secret byte patterns,
+        # or Go source code. See no_add.rego specifically for why that one
+        # is the clearest example of this layer's distinct value.
+        run: conftest test --parser dockerfile --policy policy Dockerfile
