@@ -12,14 +12,7 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 # Copy the rest of the source.
-# TEMP (test/policy-verify only): deliberately using ADD instead of COPY to
-# verify the Phase 8 policy-check job catches it. Functionally identical
-# here (plain local directory, no archive/URL), which is exactly the point
-# — the build succeeds, the resulting image is byte-for-byte identical, so
-# nothing else in the pipeline (Trivy, Semgrep, Gitleaks) would ever flag
-# this. Reverted to COPY before this branch is done being used; never lands
-# on main.
-ADD . .
+COPY . .
 
 # Static, CGO-free, stripped binaries. -trimpath keeps build paths out of the
 # binary. Everything used (pgx, bcrypt, aes, paseto) is pure Go, so no libc is
