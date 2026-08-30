@@ -508,6 +508,21 @@ jobs:
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
               f.write(summary + "\n")
 
+          # Also emit one GitHub annotation per finding (::notice:: for
+          # Low/Informational, ::warning:: for Medium, ::error:: for High).
+          # Annotations render directly on the run page and PR diff without
+          # needing to open the step log or download the artifact — the
+          # step summary above is the detailed version, this is the always-
+          # visible one.
+          annotation_cmd = {"Informational": "notice", "Low": "notice", "Medium": "warning", "High": "error"}
+          for site in data.get("site", []):
+              for alert in site.get("alerts", []):
+                  code = str(alert.get("riskcode", "0"))
+                  name = risk_names.get(code, "Unknown")
+                  cmd = annotation_cmd.get(name, "notice")
+                  n_instances = len(alert.get("instances", []))
+                  print(f"::{cmd} title=ZAP [{name}] {alert.get('name', 'unknown')}::{n_instances} instance(s). {alert.get('desc', '')[:200]}")
+
           if high_findings:
               print(f"::error::{len(high_findings)} High-severity ZAP finding(s): {', '.join(high_findings)}")
               sys.exit(1)
