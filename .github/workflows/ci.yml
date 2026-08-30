@@ -3,7 +3,10 @@ name: CI
 # Phase 3 added build + test. Phase 4 added Gitleaks secrets scanning.
 # Phase 5 added Semgrep SAST. Phase 6 added dependency/SCA scanning.
 # Phase 7 added container image scanning (inside docker-build). Phase 8
-# added the policy-as-code gate below. Deployment still comes later.
+# added the policy-as-code gate. Phase 10 added DAST (dast-scan) below —
+# Phase 9 (GCP deploy) was skipped, so DAST targets an instance of the app
+# spun up inside the CI job itself, not a public URL. Deployment still
+# comes later.
 
 on:
   push:
@@ -314,3 +317,216 @@ jobs:
         # or Go source code. See no_add.rego specifically for why that one
         # is the clearest example of this layer's distinct value.
         run: conftest test --parser dockerfile --policy policy Dockerfile
+
+  dast-scan:
+    name: DAST Scan (OWASP ZAP)
+    runs-on: ubuntu-latest
+    # Sequential, unlike every other job in this pipeline — DAST needs an
+    # actual RUNNING instance of the app, not just source/dependencies to
+    # analyze statically. There's no point spending several minutes bringing
+    # up the full stack + running ZAP against an app that doesn't even
+    # build or fails Build & Test, so this is gated on those succeeding
+    # first (a fast-fail gate, not artifact sharing — this job's own
+    # `docker compose up --build` still builds its own image on this fresh
+    # runner, same constraint as Phase 7: a separate job has no access to
+    # another job's local Docker daemon).
+    needs: [build-and-test, docker-build]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Generate CI .env for docker-compose
+        # Dummy CI-only values, not real secrets — same pattern as the
+        # other jobs. This .env is never committed; it exists only for the
+        # lifetime of this job so docker-compose (which reads .env for
+        # ${VAR} substitution) has something to work with.
+        run: |
+          cat > .env << EOF
+          ENCRYPTION_KEY=$(openssl rand -hex 32)
+          PASETO_KEY=$(openssl rand -hex 32)
+          PORT=8080
+          POSTGRES_USER=govault_ci
+          POSTGRES_PASSWORD=govault_ci_password
+          POSTGRES_DB=govault_ci_test
+          DATABASE_URL=postgres://govault_ci:govault_ci_password@localhost:5432/govault_ci_test?sslmode=disable
+          EOF
+
+      - name: Start Postgres (docker compose)
+        run: docker compose up -d --build db
+
+      - name: Run migrations against the compose-started Postgres
+        # The migrate service's own depends_on: condition: service_healthy
+        # already blocks until db is healthy — no manual polling needed.
+        run: docker compose run --rm migrate
+
+      - name: Start the app (docker compose)
+        run: docker compose up -d --build app
+
+      - name: Wait for the app to be healthy
+        # Nothing else depends on app's own health, unlike db above, so
+        # this job has to poll for it directly.
+        run: |
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:8080/healthz > /dev/null 2>&1; then
+              echo "app is up after ${i} attempt(s)"
+              curl -sS http://localhost:8080/healthz
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::app never became healthy"
+          docker compose logs app
+          exit 1
+
+      - name: Seed authenticated data (register user, create secret)
+        # So ZAP has real authenticated routes with real data to exercise
+        # (GET /secrets, GET /secrets/{id}), not just the unauthenticated
+        # /healthz and /auth endpoints.
+        run: |
+          set -e
+          curl -sf -X POST http://localhost:8080/auth/register \
+            -H 'Content-Type: application/json' \
+            -d '{"email":"zap-scan@govault.test","password":"zap-scan-password-1"}'
+          echo
+
+          TOKEN=$(curl -sf -X POST http://localhost:8080/auth/login \
+            -H 'Content-Type: application/json' \
+            -d '{"email":"zap-scan@govault.test","password":"zap-scan-password-1"}' \
+            | python3 -c "import json,sys; print(json.load(sys.stdin)['token'])")
+          echo "TOKEN=${TOKEN}" >> "$GITHUB_ENV"
+
+          curl -sf -X POST http://localhost:8080/secrets \
+            -H "Authorization: Bearer ${TOKEN}" \
+            -H 'Content-Type: application/json' \
+            -d '{"name":"zap-test-secret","value":"zap-scan-value"}'
+          echo
+
+      - name: Run OWASP ZAP baseline scan
+        # Baseline (passive-only: spider + analyze responses, no attack
+        # payloads sent) rather than full-scan (adds active scanning —
+        # actually attempts SQLi/XSS/etc against discovered params).
+        # Chosen deliberately:
+        #   - govault is a JSON REST API, not an HTML app with links/forms
+        #     for ZAP's spider to discover — without also handing it an
+        #     OpenAPI spec (which this project doesn't have yet), an active
+        #     scan would mostly be attacking the same shallow, mostly-
+        #     unauthenticated surface baseline already sees passively, for
+        #     several times the runtime.
+        #   - Passive analysis is what actually produces this project's
+        #     realistic finding class right now — missing security headers,
+        #     cookie flags, etc. — regardless of crawl depth.
+        #   - Baseline is non-destructive against our own live, ephemeral,
+        #     authenticated app: no risk of active attack payloads
+        #     corrupting the seeded test data or hammering the CI Postgres.
+        #   A genuine upgrade path later: add an OpenAPI spec and run
+        #   action-full-scan (or ZAP's API-scan mode) against it, so active
+        #   rules have real endpoints/params to target instead of guessing.
+        id: zap
+        env:
+          ZAP_AUTH_HEADER: Authorization
+          ZAP_AUTH_HEADER_VALUE: "Bearer ${{ env.TOKEN }}"
+          ZAP_AUTH_HEADER_SITE: "localhost:8080"
+        uses: zaproxy/action-baseline@v0.15.0
+        with:
+          target: "http://localhost:8080"
+          # Don't override report filenames via cmd_options — the action has
+          # its own internal default names (report_html.html, report_md.md,
+          # report_json.json) it expects regardless, and a custom -w/-r/-J
+          # here conflicts with that (confirmed live: "File .../report_md.md
+          # does not exist" when a custom name was passed). Let it use its
+          # defaults; the next step searches for whatever JSON report it
+          # actually produced instead of assuming one exact name.
+          allow_issue_writing: false
+          fail_action: false # this action step never fails the job by itself — see the severity gate below
+          artifact_name: zap-dast-report
+
+      - name: Report findings and fail only on High severity
+        # DAST tools are noisy by nature — Low/Informational findings
+        # (missing headers, cookie hygiene, etc.) are common and expected,
+        # and shouldn't block every PR. This reads ZAP's OWN reported risk
+        # level for whatever it actually found (rather than a hand-picked
+        # rule-ID allowlist) and only fails the job if something is
+        # genuinely High risk. Everything found is still printed here and
+        # in the job summary either way, and the full report is uploaded
+        # as the zap-dast-report artifact regardless of outcome.
+        run: |
+          echo "--- JSON files present in workspace (debugging report-path assumptions) ---"
+          find . -maxdepth 2 -iname "*.json" 2>/dev/null
+          python3 - << 'PYEOF'
+          import json, glob, sys, os
+
+          # The action's default report filename is report_json.json
+          # (confirmed live: its default report_md.md/report_html.html
+          # errored when we tried to override the name, so we now rely on
+          # its defaults instead). Search broadly as a fallback in case that
+          # assumption is still slightly off.
+          candidates = (
+              glob.glob("report_json.json")
+              or glob.glob("**/report_json.json", recursive=True)
+              or glob.glob("**/report*.json", recursive=True)
+          )
+          if not candidates:
+              print("::warning::No ZAP JSON report found — ZAP ran but the report file wasn't where expected. Check the zap-dast-report artifact for the actual results, and the 'JSON files present' debug listing above.")
+              sys.exit(0)
+
+          print(f"Using report file: {candidates[0]}")
+          with open(candidates[0]) as f:
+              data = json.load(f)
+
+          risk_names = {"0": "Informational", "1": "Low", "2": "Medium", "3": "High"}
+          counts = {name: 0 for name in risk_names.values()}
+          high_findings = []
+
+          for site in data.get("site", []):
+              for alert in site.get("alerts", []):
+                  code = str(alert.get("riskcode", "0"))
+                  name = risk_names.get(code, "Unknown")
+                  counts[name] = counts.get(name, 0) + 1
+                  if name == "High":
+                      high_findings.append(alert.get("name", "unknown alert"))
+
+          summary_lines = ["### 🕷️ OWASP ZAP baseline scan — govault"]
+          summary_lines.append("")
+          summary_lines.append("| Risk | Count |")
+          summary_lines.append("|---|---|")
+          for name in ["High", "Medium", "Low", "Informational"]:
+              summary_lines.append(f"| {name} | {counts.get(name, 0)} |")
+          summary_lines.append("")
+          for site in data.get("site", []):
+              for alert in site.get("alerts", []):
+                  code = str(alert.get("riskcode", "0"))
+                  name = risk_names.get(code, "Unknown")
+                  summary_lines.append(f"- **[{name}]** {alert.get('name', 'unknown')} — {len(alert.get('instances', []))} instance(s)")
+
+          summary = "\n".join(summary_lines)
+          print(summary)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write(summary + "\n")
+
+          # Also emit one GitHub annotation per finding (::notice:: for
+          # Low/Informational, ::warning:: for Medium, ::error:: for High).
+          # Annotations render directly on the run page and PR diff without
+          # needing to open the step log or download the artifact — the
+          # step summary above is the detailed version, this is the always-
+          # visible one.
+          annotation_cmd = {"Informational": "notice", "Low": "notice", "Medium": "warning", "High": "error"}
+          for site in data.get("site", []):
+              for alert in site.get("alerts", []):
+                  code = str(alert.get("riskcode", "0"))
+                  name = risk_names.get(code, "Unknown")
+                  cmd = annotation_cmd.get(name, "notice")
+                  n_instances = len(alert.get("instances", []))
+                  print(f"::{cmd} title=ZAP [{name}] {alert.get('name', 'unknown')}::{n_instances} instance(s). {alert.get('desc', '')[:200]}")
+
+          if high_findings:
+              print(f"::error::{len(high_findings)} High-severity ZAP finding(s): {', '.join(high_findings)}")
+              sys.exit(1)
+          PYEOF
+
+      - name: Dump container logs on failure
+        if: failure()
+        run: docker compose logs
+
+      - name: Tear down the stack
+        if: always()
+        run: docker compose down -v
