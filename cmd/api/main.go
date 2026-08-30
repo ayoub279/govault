@@ -62,6 +62,7 @@ func run() error {
 	r.Use(chimw.Logger)
 	r.Use(chimw.Recoverer)
 	r.Use(chimw.Timeout(15 * time.Second))
+	r.Use(middleware.SecurityHeaders)
 
 	// Health check.
 	r.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) {
