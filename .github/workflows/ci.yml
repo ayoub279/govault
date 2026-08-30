@@ -434,7 +434,13 @@ jobs:
         uses: zaproxy/action-baseline@v0.15.0
         with:
           target: "http://localhost:8080"
-          cmd_options: "-J zap-report.json -w zap-report.md -r zap-report.html"
+          # Don't override report filenames via cmd_options — the action has
+          # its own internal default names (report_html.html, report_md.md,
+          # report_json.json) it expects regardless, and a custom -w/-r/-J
+          # here conflicts with that (confirmed live: "File .../report_md.md
+          # does not exist" when a custom name was passed). Let it use its
+          # defaults; the next step searches for whatever JSON report it
+          # actually produced instead of assuming one exact name.
           allow_issue_writing: false
           fail_action: false # this action step never fails the job by itself — see the severity gate below
           artifact_name: zap-dast-report
@@ -449,14 +455,26 @@ jobs:
         # in the job summary either way, and the full report is uploaded
         # as the zap-dast-report artifact regardless of outcome.
         run: |
+          echo "--- JSON files present in workspace (debugging report-path assumptions) ---"
+          find . -maxdepth 2 -iname "*.json" 2>/dev/null
           python3 - << 'PYEOF'
           import json, glob, sys, os
 
-          candidates = glob.glob("**/zap-report.json", recursive=True)
+          # The action's default report filename is report_json.json
+          # (confirmed live: its default report_md.md/report_html.html
+          # errored when we tried to override the name, so we now rely on
+          # its defaults instead). Search broadly as a fallback in case that
+          # assumption is still slightly off.
+          candidates = (
+              glob.glob("report_json.json")
+              or glob.glob("**/report_json.json", recursive=True)
+              or glob.glob("**/report*.json", recursive=True)
+          )
           if not candidates:
-              print("::warning::No zap-report.json found — ZAP ran but the report file wasn't where expected. Check the zap-dast-report artifact for the actual results.")
+              print("::warning::No ZAP JSON report found — ZAP ran but the report file wasn't where expected. Check the zap-dast-report artifact for the actual results, and the 'JSON files present' debug listing above.")
               sys.exit(0)
 
+          print(f"Using report file: {candidates[0]}")
           with open(candidates[0]) as f:
               data = json.load(f)
 
